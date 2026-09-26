@@ -13,9 +13,11 @@
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
-  type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
+  type ViewMode = 'compose' | 'path' | 'issues' | 'versions' | 'play';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
+  type PlayStatus = 'done' | 'skipped' | 'reconfirm';
+  type PlayAction = 'start' | 'complete' | 'skip' | 'rollback' | 'reconfirm';
 
   interface Activity {
     id: string;
@@ -29,6 +31,29 @@
     accessibility: string;
     duration: number;
     feedback: string;
+  }
+
+  interface PlayRecord {
+    status: PlayStatus;
+    at: string;
+    reason?: string;
+  }
+
+  interface PlayLogEntry {
+    id: string;
+    action: PlayAction;
+    activityId: string;
+    at: string;
+    detail: string;
+  }
+
+  interface PlaySession {
+    started: boolean;
+    startedAt: string;
+    currentId: string;
+    records: Record<string, PlayRecord>;
+    logs: PlayLogEntry[];
+    rolledBack: string[];
   }
 
   interface CourseVersion {
@@ -47,6 +72,7 @@
     objective: string;
     activities: Activity[];
     versions: CourseVersion[];
+    play: PlaySession;
     updatedAt: string;
   }
 
@@ -154,8 +180,13 @@
           }
         ]
       }
-    ]
+    ],
+    play: emptyPlaySession()
   });
+
+  function emptyPlaySession(): PlaySession {
+    return { started: false, startedAt: '', currentId: '', records: {}, logs: [], rolledBack: [] };
+  }
 
   let course: Course = initialCourse();
   let selectedActivityId = course.activities[0]?.id ?? '';
@@ -172,6 +203,8 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let skipReason = '';
+  let showSkipForm = false;
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
@@ -179,6 +212,28 @@
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+
+  interface PlayRow {
+    index: number;
+    activity: Activity;
+    record: PlayRecord | null;
+    blockers: Activity[];
+  }
+
+  $: playRows = course.activities.map((activity, index) => ({
+    index,
+    activity,
+    record: course.play.records[activity.id] ?? null,
+    blockers: activity.dependencies
+      .map((id) => course.activities.find((item) => item.id === id))
+      .filter((item): item is Activity => item !== undefined && course.play.records[item.id]?.status !== 'done')
+  }));
+  $: playUpcoming = playRows.filter((row) => !row.record || row.record.status === 'reconfirm');
+  $: playFinished = playRows.filter((row) => row.record !== null && row.record.status !== 'reconfirm');
+  $: playDoneCount = playRows.filter((row) => row.record?.status === 'done').length;
+  $: playSkipCount = playRows.filter((row) => row.record?.status === 'skipped').length;
+  $: playAllDone = course.play.started && course.activities.length > 0 && playUpcoming.length === 0;
+  $: currentPlayRow = playRows.find((row) => row.activity.id === course.play.currentId) ?? playUpcoming[0] ?? null;
 
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -189,6 +244,10 @@
         compareBaseId = course.versions[0]?.id ?? '';
         compareTargetId = course.versions.at(-1)?.id ?? '';
         savedLabel = `已恢复 · ${formatTime(course.updatedAt)}`;
+        if (course.play.started) {
+          activeView = 'play';
+          selectedActivityId = course.play.currentId || selectedActivityId;
+        }
       } catch {
         localStorage.removeItem(STORAGE_KEY);
       }
@@ -210,6 +269,12 @@
   function migrateCourse(value: Course): Course {
     if (!value.id || !Array.isArray(value.activities)) return initialCourse();
     value.versions ??= [];
+    value.play ??= emptyPlaySession();
+    value.play.records ??= {};
+    value.play.logs ??= [];
+    value.play.rolledBack ??= [];
+    if (typeof value.play.started !== 'boolean') value.play.started = false;
+    if (typeof value.play.currentId !== 'string') value.play.currentId = '';
     return value;
   }
 
@@ -262,7 +327,14 @@
     const id = selectedActivity.id;
     commit((draft) => {
       const target = draft.activities.find((activity) => activity.id === id);
-      if (target) (target as unknown as Record<string, unknown>)[field] = value;
+      if (!target) return;
+      const before = (target as unknown as Record<string, unknown>)[field];
+      const changed = JSON.stringify(before) !== JSON.stringify(value);
+      (target as unknown as Record<string, unknown>)[field] = value;
+      // 回退修改后，直接或间接依赖该活动、且已有结论的记录转为“待重新确认”
+      if (changed && draft.play.started && draft.play.rolledBack.includes(id)) {
+        cascadeReconfirm(draft, id);
+      }
     });
   }
 
@@ -309,6 +381,11 @@
       draft.activities.forEach((activity) => {
         activity.dependencies = activity.dependencies.filter((dependency) => dependency !== id);
       });
+      // 移除的活动不再占用课堂进度
+      delete draft.play.records[id];
+      draft.play.logs = draft.play.logs.filter((log) => log.activityId !== id);
+      draft.play.rolledBack = draft.play.rolledBack.filter((item) => item !== id);
+      if (draft.play.currentId === id) draft.play.currentId = '';
     });
     selectedActivityId = course.activities[0]?.id ?? '';
   }
@@ -378,6 +455,7 @@
       draft.title = copy.title;
       draft.versions = copy.versions;
       draft.activities = copy.activities;
+      draft.play = emptyPlaySession();
     });
     savedLabel = '课程已复制为新草稿';
   }
@@ -385,6 +463,149 @@
   function focusIssue(issue: Diagnostic): void {
     selectedActivityId = issue.activityId;
     activeView = 'compose';
+  }
+
+  function playLog(draft: Course, action: PlayAction, activityId: string, detail: string): void {
+    draft.play.logs.push({
+      id: `log-${Date.now()}-${draft.play.logs.length}`,
+      action, activityId, detail, at: new Date().toISOString()
+    });
+  }
+
+  function collectDependents(activities: Activity[], id: string): string[] {
+    const dependents = new Set<string>();
+    let grew = true;
+    while (grew) {
+      grew = false;
+      for (const activity of activities) {
+        if (dependents.has(activity.id) || activity.id === id) continue;
+        if (activity.dependencies.some((dependency) => dependency === id || dependents.has(dependency))) {
+          dependents.add(activity.id);
+          grew = true;
+        }
+      }
+    }
+    return [...dependents];
+  }
+
+  function cascadeReconfirm(draft: Course, id: string): void {
+    const target = draft.activities.find((activity) => activity.id === id);
+    if (!target) return;
+    const affected = collectDependents(draft.activities, id).filter((dependentId) => draft.play.records[dependentId]);
+    if (!affected.length) return;
+    const at = new Date().toISOString();
+    affected.forEach((dependentId) => {
+      draft.play.records[dependentId] = { status: 'reconfirm', at };
+      playLog(draft, 'reconfirm', dependentId, `前置活动“${target.title}”回退后被修改，需要重新确认`);
+    });
+  }
+
+  function isPending(record: PlayRecord | undefined): boolean {
+    return !record || record.status === 'reconfirm';
+  }
+
+  function advanceCurrent(draft: Course, afterIndex: number): void {
+    const rest = draft.activities.slice(afterIndex + 1);
+    const next = rest.find((activity) => isPending(draft.play.records[activity.id]))
+      ?? draft.activities.find((activity) => isPending(draft.play.records[activity.id]));
+    draft.play.currentId = next?.id ?? '';
+  }
+
+  function startPlayback(): void {
+    commit((draft) => {
+      draft.play = emptyPlaySession();
+      draft.play.started = true;
+      draft.play.startedAt = new Date().toISOString();
+      const first = draft.activities[0];
+      draft.play.currentId = first?.id ?? '';
+      playLog(draft, 'start', first?.id ?? '', `课堂开始，共 ${draft.activities.length} 个活动`);
+    });
+    skipReason = '';
+    showSkipForm = false;
+    activeView = 'play';
+  }
+
+  function resetPlayback(): void {
+    if (!confirm('确定要结束本次课堂并清空所有课堂记录吗？课程本身不受影响。')) return;
+    commit((draft) => { draft.play = emptyPlaySession(); });
+    skipReason = '';
+    showSkipForm = false;
+  }
+
+  function selectCurrent(id: string): void {
+    course.play.currentId = id;
+    skipReason = '';
+    showSkipForm = false;
+    persist();
+  }
+
+  function completeActivity(): void {
+    const row = currentPlayRow;
+    const isReconfirm = row?.record?.status === 'reconfirm';
+    if (!row || (row.record && !isReconfirm) || row.blockers.length) return;
+    const id = row.activity.id;
+    commit((draft) => {
+      const activity = draft.activities.find((item) => item.id === id);
+      if (!activity) return;
+      draft.play.records[id] = { status: 'done', at: new Date().toISOString() };
+      draft.play.rolledBack = draft.play.rolledBack.filter((item) => item !== id);
+      playLog(draft, isReconfirm ? 'reconfirm' : 'complete', id, isReconfirm ? `重新确认通过“${activity.title}”` : `完成“${activity.title}”`);
+      advanceCurrent(draft, row.index);
+    });
+    skipReason = '';
+    showSkipForm = false;
+  }
+
+  function confirmSkip(): void {
+    const row = currentPlayRow;
+    const reason = skipReason.trim();
+    if (!row || (row.record && row.record.status !== 'reconfirm') || row.blockers.length || !reason) return;
+    const id = row.activity.id;
+    commit((draft) => {
+      const activity = draft.activities.find((item) => item.id === id);
+      if (!activity) return;
+      draft.play.records[id] = { status: 'skipped', at: new Date().toISOString(), reason };
+      draft.play.rolledBack = draft.play.rolledBack.filter((item) => item !== id);
+      playLog(draft, 'skip', id, `跳过“${activity.title}” · 原因：${reason}`);
+      advanceCurrent(draft, row.index);
+    });
+    skipReason = '';
+    showSkipForm = false;
+  }
+
+  function rollbackActivity(id: string): void {
+    const row = playRows.find((item) => item.activity.id === id);
+    if (!row?.record) return;
+    commit((draft) => {
+      const activity = draft.activities.find((item) => item.id === id);
+      if (!activity) return;
+      delete draft.play.records[id];
+      if (!draft.play.rolledBack.includes(id)) draft.play.rolledBack.push(id);
+      playLog(draft, 'rollback', id, `回退“${activity.title}”重新讲；若随后修改该活动，依赖它的后续记录将转为待重新确认`);
+      draft.play.currentId = id;
+    });
+    skipReason = '';
+    showSkipForm = false;
+  }
+
+  function playStatusLabel(status: PlayStatus): string {
+    return status === 'done' ? '已完成' : status === 'skipped' ? '已跳过' : '待重新确认';
+  }
+
+  function playRecordsLabel(record: PlayRecord | undefined): string {
+    return record ? `（${playStatusLabel(record.status)}）` : '（未讲）';
+  }
+
+  function playActionLabel(action: PlayAction): string {
+    return action === 'start' ? '开课' : action === 'complete' ? '讲完' : action === 'skip' ? '跳过' : action === 'rollback' ? '回退' : '待重新确认';
+  }
+
+  function playTagType(status: PlayStatus): 'green' | 'purple' | 'warm-gray' {
+    return status === 'done' ? 'green' : status === 'skipped' ? 'purple' : 'warm-gray';
+  }
+
+  function playActivityTitle(id: string): string {
+    return course.activities.find((activity) => activity.id === id)?.title ?? '（活动已移除）';
   }
 
   function analyzeCourse(current: Course): Diagnostic[] {
@@ -597,6 +818,7 @@
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'play'} on:click={() => activeView = 'play'}><span>05</span><b>课堂播放</b><small>进度、锁定与课堂记录</small></button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -803,6 +1025,161 @@
           </div>
         </Tile>
       </div>
+    </main>
+  {/if}
+
+  {#if activeView === 'play'}
+    <main class="play-view">
+      <div class="view-heading">
+        <div><span class="kicker">CLASSROOM PLAYBACK</span><h2>课堂播放区</h2><p>按课程顺序授课：前置活动未讲完的条目保持锁定，所有讲完、跳过与回退都会留痕。</p></div>
+        <div class="version-actions">
+          {#if course.play.started}
+            <Button kind="danger-tertiary" on:click={resetPlayback}>结束并清空记录</Button>
+          {:else}
+            <Button kind="primary" on:click={startPlayback}>开始上课</Button>
+          {/if}
+        </div>
+      </div>
+
+      {#if !course.play.started}
+        <Tile class="play-empty">
+          <h3>课堂尚未开始</h3>
+          <p>点击「开始上课」后会按课程顺序列出待讲活动；前置活动没讲完的条目会保持锁定，并提示卡在哪一步。中途关掉页面，回来后可以从当前活动继续。</p>
+          <Button kind="primary" on:click={startPlayback}>开始上课</Button>
+        </Tile>
+      {:else}
+        <div class="play-progress">
+          <div class="play-progress-meta">
+            <span>已讲 <b>{playDoneCount}</b> / {course.activities.length} 个活动</span>
+            <span>跳过 <b>{playSkipCount}</b></span>
+            <span>待讲 <b>{playUpcoming.length}</b></span>
+            <span>开课于 {formatTime(course.play.startedAt)}</span>
+          </div>
+          <div class="play-progress-bar"><i style={`width: ${course.activities.length ? Math.round((playDoneCount / course.activities.length) * 100) : 0}%`}></i></div>
+        </div>
+
+        {#if playAllDone}
+          <Tile class="play-complete">
+            <h3>本节课已全部结束</h3>
+            <p>共完成 {playDoneCount} 个活动{#if playSkipCount}，跳过 {playSkipCount} 个（可在下方记录中回退重讲）{/if}。</p>
+            <Button kind="tertiary" on:click={resetPlayback}>结束并清空记录</Button>
+          </Tile>
+        {:else if currentPlayRow}
+          <section class="play-current" class:locked={currentPlayRow.blockers.length > 0}>
+            <div class="play-current-head">
+              <span class="kicker">NOW TEACHING · 第 {currentPlayRow.index + 1} 个活动</span>
+              {#if currentPlayRow.record?.status === 'reconfirm'}
+                <Tag type="warm-gray">待重新确认</Tag>
+              {:else if currentPlayRow.blockers.length}
+                <Tag type="red">前置未完成</Tag>
+              {:else}
+                <Tag type="teal">进行中</Tag>
+              {/if}
+            </div>
+            <h3>{currentPlayRow.activity.title}</h3>
+            <div class="play-current-meta">
+              <span class="activity-type {currentPlayRow.activity.type}">{currentPlayRow.activity.type}</span>
+              <span>{currentPlayRow.activity.duration} 分钟</span>
+              <span>难度 {currentPlayRow.activity.difficulty}/5</span>
+              {#each currentPlayRow.activity.phonemes as phoneme}<span class="phoneme-chip">{phoneme}</span>{/each}
+            </div>
+            {#if currentPlayRow.activity.content}<p class="play-content">{currentPlayRow.activity.content}</p>{/if}
+            {#if currentPlayRow.activity.prompt}<blockquote>{currentPlayRow.activity.prompt}</blockquote>{/if}
+            {#if currentPlayRow.blockers.length}
+              <div class="play-lock-note">
+                <b>暂时锁定，卡在前置活动：</b>
+                {#each currentPlayRow.blockers as blocker}
+                  <span>「{blocker.title}」{playRecordsLabel(course.play.records[blocker.id])}</span>
+                {/each}
+                <small>请先完成上面的前置活动，或将其回退重讲后再继续。</small>
+              </div>
+            {/if}
+            <div class="play-actions">
+              <Button kind="primary" disabled={currentPlayRow.blockers.length > 0} on:click={completeActivity}>
+                {currentPlayRow.record?.status === 'reconfirm' ? '重新确认通过' : '讲完，进入下一活动'}
+              </Button>
+              {#if showSkipForm}
+                <div class="skip-form">
+                  <TextInput labelText="跳过原因（必填，将写入课堂记录）" placeholder="例如：学生已掌握 / 时间不够，下次补讲" value={skipReason} on:input={(event) => skipReason = readText(event)} />
+                  <Button kind="danger" disabled={!skipReason.trim()} on:click={confirmSkip}>确认跳过</Button>
+                  <Button kind="ghost" on:click={() => { showSkipForm = false; skipReason = ''; }}>取消</Button>
+                </div>
+              {:else}
+                <Button kind="danger-tertiary" disabled={currentPlayRow.blockers.length > 0} on:click={() => showSkipForm = true}>跳过（需填写原因）</Button>
+              {/if}
+            </div>
+          </section>
+        {/if}
+
+        <div class="play-columns">
+          <section class="play-panel">
+            <div class="section-title"><div><span class="kicker">UP NEXT</span><h3>待讲活动</h3></div><Tag type="cool-gray">{playUpcoming.length} 个</Tag></div>
+            {#each playUpcoming as row (row.activity.id)}
+              <button
+                class="play-row"
+                class:current={row.activity.id === course.play.currentId}
+                class:locked={row.blockers.length > 0}
+                on:click={() => selectCurrent(row.activity.id)}
+              >
+                <span class="sequence">{String(row.index + 1).padStart(2, '0')}</span>
+                <span class="activity-type {row.activity.type}">{row.activity.type}</span>
+                <span class="play-row-copy">
+                  <b>{row.activity.title}</b>
+                  {#if row.record?.status === 'reconfirm'}
+                    <small class="reconfirm-note">⟳ 前置活动被修改，需要重新确认{row.blockers.length ? `；同时卡在「${row.blockers.map((item) => item.title).join('、')}」` : ''}</small>
+                  {:else if row.blockers.length}
+                    <small class="lock-note">🔒 卡在「{row.blockers[0].title}」{playRecordsLabel(course.play.records[row.blockers[0].id])}{row.blockers.length > 1 ? ` 等 ${row.blockers.length} 个前置` : ''}</small>
+                  {:else}
+                    <small>{row.activity.duration} 分钟 · 可以开讲</small>
+                  {/if}
+                </span>
+                {#if row.record?.status === 'reconfirm'}
+                  <Tag type="warm-gray">待确认</Tag>
+                {:else}
+                  <i>{row.blockers.length ? '🔒' : row.activity.id === course.play.currentId ? '▶' : '→'}</i>
+                {/if}
+              </button>
+            {:else}
+              <p class="empty-state">没有待讲活动了。</p>
+            {/each}
+          </section>
+
+          <section class="play-panel">
+            <div class="section-title"><div><span class="kicker">DONE & LOG</span><h3>已完成与课堂记录</h3></div><Tag type="cool-gray">{playFinished.length} 个</Tag></div>
+            {#each playFinished as row (row.activity.id)}
+              <article class="play-row done">
+                <span class="sequence">{String(row.index + 1).padStart(2, '0')}</span>
+                <span class="activity-type {row.activity.type}">{row.activity.type}</span>
+                <span class="play-row-copy">
+                  <b>{row.activity.title}</b>
+                  <small>
+                    {playStatusLabel(row.record!.status)} · {formatTime(row.record!.at)}
+                    {row.record!.status === 'skipped' && row.record!.reason ? ` · 原因：${row.record!.reason}` : ''}
+                    {row.record!.status === 'reconfirm' ? ' · 前置活动被修改，需重新确认' : ''}
+                  </small>
+                </span>
+                <Tag type={playTagType(row.record!.status)}>{playStatusLabel(row.record!.status)}</Tag>
+                <Button size="small" kind="ghost" on:click={() => rollbackActivity(row.activity.id)}>回退</Button>
+              </article>
+            {:else}
+              <p class="empty-state">还没有完成任何活动。</p>
+            {/each}
+
+            <div class="play-log">
+              <div class="section-title"><div><span class="kicker">LOG</span><h3>课堂记录</h3></div><Tag type="cool-gray">{course.play.logs.length} 条</Tag></div>
+              {#each [...course.play.logs].reverse() as log (log.id)}
+                <div class="play-log-row">
+                  <Tag type={log.action === 'complete' ? 'green' : log.action === 'skip' ? 'purple' : log.action === 'start' ? 'teal' : 'warm-gray'}>{playActionLabel(log.action)}</Tag>
+                  <div><b>{playActivityTitle(log.activityId)}</b><p>{log.detail}</p></div>
+                  <time>{formatTime(log.at)}</time>
+                </div>
+              {:else}
+                <p class="empty-state">课堂开始后，讲完、跳过、回退和待重新确认都会记录在这里。</p>
+              {/each}
+            </div>
+          </section>
+        </div>
+      {/if}
     </main>
   {/if}
 
