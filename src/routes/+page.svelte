@@ -13,7 +13,7 @@
   } from 'carbon-components-svelte';
 
   type ActivityType = '音素' | '单词' | '句子' | '练习';
-  type ViewMode = 'compose' | 'path' | 'issues' | 'versions';
+  type ViewMode = 'compose' | 'path' | 'issues' | 'versions' | 'playback';
   type PreviewWidth = 'phone' | 'tablet' | 'desktop';
   type IssueLevel = 'error' | 'warning' | 'info';
 
@@ -47,6 +47,7 @@
     objective: string;
     activities: Activity[];
     versions: CourseVersion[];
+    session: ClassSession;
     updatedAt: string;
   }
 
@@ -66,10 +67,45 @@
     detail: string;
   }
 
+  type SessionStatus = 'completed' | 'skipped' | 'reconfirm';
+  type SessionAction = 'start' | 'pass' | 'skip' | 'rollback' | 'reconfirm' | 'reset';
+
+  interface SessionEntry {
+    status: SessionStatus;
+    reason?: string;
+    at: string;
+  }
+
+  interface SessionLogEntry {
+    id: string;
+    action: SessionAction;
+    activityId?: string;
+    activityTitle?: string;
+    reason?: string;
+    dependents?: Array<{ id: string; title: string }>;
+    at: string;
+  }
+
+  interface ClassSession {
+    started: boolean;
+    startedAt: string;
+    currentId: string;
+    entries: Record<string, SessionEntry>;
+    logs: SessionLogEntry[];
+  }
+
   const STORAGE_KEY = 'sologsb-1026-phonics-course-v1';
   const confusablePairs = [
     ['/b/', '/p/'], ['/d/', '/t/'], ['/f/', '/v/'], ['/m/', '/n/'], ['/ɪ/', '/iː/'], ['/æ/', '/e/']
   ];
+
+  const freshSession = (): ClassSession => ({
+    started: false,
+    startedAt: '',
+    currentId: '',
+    entries: {},
+    logs: []
+  });
 
   const initialCourse = (): Course => ({
     id: 'course-phonics-1',
@@ -128,6 +164,7 @@
         accessibility: '提供分句导航、朗读速度控制和高对比模式。', duration: 12, feedback: ''
       }
     ],
+    session: freshSession(),
     versions: [
       {
         id: 'v-1', label: '初稿', savedAt: '2026-09-21T10:00:00+08:00', note: '完成音素和基础拼读活动。',
@@ -172,6 +209,8 @@
   let selectedActivity: Activity | null = null;
   let diagnostics: Diagnostic[] = [];
   let versionDiff: VersionDiff[] = [];
+  let skipActivityId = '';
+  let skipReason = '';
 
   $: selectedActivity = course.activities.find((activity) => activity.id === selectedActivityId) ?? course.activities[0] ?? null;
   $: diagnostics = analyzeCourse(course);
@@ -179,6 +218,41 @@
   $: errorCount = diagnostics.filter((issue) => issue.level === 'error').length;
   $: warningCount = diagnostics.filter((issue) => issue.level === 'warning').length;
   $: totalMinutes = course.activities.reduce((sum, activity) => sum + activity.duration, 0);
+
+  // —— 课堂播放派生状态：记录按活动 ID 挂在 session.entries 上 ——
+  interface SessionRow {
+    activity: Activity;
+    index: number;
+    entry: SessionEntry | null;
+    blockers: Array<{ id: string; title: string; missing: boolean; entry: SessionEntry | null }>;
+  }
+
+  $: sessionRows = course.activities.map((activity, index) => {
+    const blockers = activity.dependencies.map((id) => {
+      const depActivity = course.activities.find((item) => item.id === id);
+      return {
+        id,
+        title: depActivity?.title ?? '已移除的活动',
+        missing: !depActivity,
+        entry: course.session.entries[id] ?? null
+      };
+    });
+    return { activity, index, entry: course.session.entries[activity.id] ?? null, blockers };
+  });
+  // 前置活动只有“过关（completed）”才算通过；跳过、待重新确认或缺失都会卡住后续。
+  $: passedCount = sessionRows.filter((row) => row.entry?.status === 'completed').length;
+  $: skippedCount = sessionRows.filter((row) => row.entry?.status === 'skipped').length;
+  $: reconfirmCount = sessionRows.filter((row) => row.entry?.status === 'reconfirm').length;
+  $: openCount = sessionRows.length - passedCount - skippedCount;
+  $: sessionProgress = sessionRows.length ? Math.round(((passedCount + skippedCount) / sessionRows.length) * 100) : 0;
+  $: firstActionable = sessionRows.find((row) => !row.entry && !row.blockers.some((blocker) => blocker.missing || blocker.entry?.status !== 'completed'))?.activity ?? null;
+  $: currentRow = sessionRows.find((row) => row.activity.id === course.session.currentId)
+    ?? sessionRows.find((row) => !row.entry && !row.blockers.some((blocker) => blocker.missing || blocker.entry?.status !== 'completed'))
+    ?? null;
+  $: skipRow = sessionRows.find((row) => row.activity.id === skipActivityId) ?? null;
+  // 正在填写跳过原因时，大卡片切到该活动（可能是被锁定的前置）；否则展示当前活动。
+  $: displayRow = skipRow ?? currentRow;
+  $: sessionLogs = [...course.session.logs].reverse();
 
   onMount(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -210,6 +284,19 @@
   function migrateCourse(value: Course): Course {
     if (!value.id || !Array.isArray(value.activities)) return initialCourse();
     value.versions ??= [];
+    if (!value.session) {
+      value.session = freshSession();
+    } else {
+      value.session.entries ??= {};
+      value.session.logs ??= [];
+      // 移除的活动不再占进度，其记录与当前指针一并清掉，日志作为课堂记录保留。
+      for (const id of Object.keys(value.session.entries)) {
+        if (!value.activities.some((activity) => activity.id === id)) delete value.session.entries[id];
+      }
+      if (value.session.currentId && !value.activities.some((activity) => activity.id === value.session.currentId)) {
+        value.session.currentId = '';
+      }
+    }
     return value;
   }
 
@@ -229,11 +316,27 @@
     savedLabel = `已保存 · ${formatTime(new Date().toISOString())}`;
   }
 
+  function pruneSession(session: ClassSession, activities: Activity[]): void {
+    for (const id of Object.keys(session.entries)) {
+      if (!activities.some((activity) => activity.id === id)) delete session.entries[id];
+    }
+    if (session.currentId && !activities.some((activity) => activity.id === session.currentId)) {
+      session.currentId = '';
+    }
+  }
+
+  // 课堂记录属于授课过程，编排撤销/重做不应把课堂进度一起回滚。
+  function keepLiveSession(restored: Course): void {
+    restored.session = structuredClone(course.session);
+    pruneSession(restored.session, restored.activities);
+  }
+
   function undo(): void {
     const previous = history.at(-1);
     if (!previous) return;
     future = [structuredClone(course), ...future].slice(0, 50);
     history = history.slice(0, -1);
+    keepLiveSession(previous);
     course = previous;
     selectedActivityId = course.activities[0]?.id ?? '';
     persist();
@@ -244,6 +347,7 @@
     if (!next) return;
     history = [...history, structuredClone(course)].slice(-50);
     future = future.slice(1);
+    keepLiveSession(next);
     course = next;
     selectedActivityId = course.activities[0]?.id ?? '';
     persist();
@@ -309,6 +413,11 @@
       draft.activities.forEach((activity) => {
         activity.dependencies = activity.dependencies.filter((dependency) => dependency !== id);
       });
+      // 被移除的活动不再占用课堂进度；它的课堂操作仍保留在日志中可追溯。
+      if (draft.session) {
+        delete draft.session.entries[id];
+        if (draft.session.currentId === id) draft.session.currentId = '';
+      }
     });
     selectedActivityId = course.activities[0]?.id ?? '';
   }
@@ -378,6 +487,7 @@
       draft.title = copy.title;
       draft.versions = copy.versions;
       draft.activities = copy.activities;
+      draft.session = freshSession();
     });
     savedLabel = '课程已复制为新草稿';
   }
@@ -386,6 +496,165 @@
     selectedActivityId = issue.activityId;
     activeView = 'compose';
   }
+
+  // —— 课堂播放：课堂操作独立持久化，不进入课程编排的撤销/重做栈 ——
+  function persistSession(mutate: (session: ClassSession, next: Course) => void): void {
+    if (!hydrated) return;
+    const next: Course = { ...course, session: structuredClone(course.session) };
+    mutate(next.session, next);
+    course = next;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(course));
+    savedLabel = `课堂已记录 · ${formatTime(new Date().toISOString())}`;
+  }
+
+  function pushSessionLog(session: ClassSession, log: Omit<SessionLogEntry, 'id' | 'at'>): void {
+    session.logs.push({ ...log, id: `log-${Date.now()}-${session.logs.length}`, at: new Date().toISOString() });
+    session.logs = session.logs.slice(-200);
+  }
+
+  function activityUnpassed(activity: Activity | undefined, session: ClassSession): boolean {
+    if (!activity) return true;
+    return session.entries[activity.id]?.status !== 'completed';
+  }
+
+  // 返回挡住某活动的前置：前置已被移除、跳过或回退待确认都会列出。
+  function getBlockers(activity: Activity, session: ClassSession = course.session): SessionRow['blockers'] {
+    return activity.dependencies.map((id) => {
+      const depActivity = course.activities.find((item) => item.id === id);
+      return {
+        id,
+        title: depActivity?.title ?? '已移除的活动',
+        missing: !depActivity,
+        entry: session.entries[id] ?? null
+      };
+    });
+  }
+
+  function isBlocked(activity: Activity, session: ClassSession = course.session): boolean {
+    return getBlockers(activity, session).some((blocker) => blocker.missing || blocker.entry?.status !== 'completed');
+  }
+
+  function nextOpenActivity(session: ClassSession, activities: Activity[]): Activity | null {
+    return activities.find((activity) => {
+      const entry = session.entries[activity.id];
+      if (entry) return false;
+      return !activity.dependencies.some((depId) => {
+        const depActivity = activities.find((item) => item.id === depId);
+        return activityUnpassed(depActivity, session);
+      });
+    }) ?? null;
+  }
+
+  function startClass(): void {
+    if (course.session.started) return;
+    persistSession((session, next) => {
+      session.started = true;
+      session.startedAt = new Date().toISOString();
+      session.currentId = next.activities[0]?.id ?? '';
+      pushSessionLog(session, { action: 'start' });
+    });
+    activeView = 'playback';
+  }
+
+  function setCurrent(activity: Activity): void {
+    if (course.session.entries[activity.id] || isBlocked(activity)) return;
+    persistSession((session) => { session.currentId = activity.id; });
+  }
+
+  function passActivity(activityId: string): void {
+    const activity = course.activities.find((item) => item.id === activityId);
+    if (!activity || isBlocked(activity)) return;
+    persistSession((session, next) => {
+      const wasReconfirm = session.entries[activityId]?.status === 'reconfirm';
+      session.entries[activityId] = { status: 'completed', at: new Date().toISOString() };
+      pushSessionLog(session, {
+        action: wasReconfirm ? 'reconfirm' : 'pass',
+        activityId,
+        activityTitle: activity.title
+      });
+      session.currentId = nextOpenActivity(session, next.activities)?.id ?? '';
+    });
+  }
+
+  function beginSkip(activityId: string): void {
+    const activity = course.activities.find((item) => item.id === activityId);
+    if (!activity) return;
+    skipActivityId = activityId;
+    skipReason = course.session.entries[activityId]?.status === 'skipped' ? (course.session.entries[activityId].reason ?? '') : '';
+  }
+
+  function cancelSkip(): void {
+    skipActivityId = '';
+    skipReason = '';
+  }
+
+  function confirmSkip(): void {
+    const reason = skipReason.trim();
+    const activityId = skipActivityId;
+    const activity = course.activities.find((item) => item.id === activityId);
+    if (!activityId || !activity || !reason) return;
+    persistSession((session, next) => {
+      session.entries[activityId] = { status: 'skipped', reason, at: new Date().toISOString() };
+      pushSessionLog(session, { action: 'skip', activityId, activityTitle: activity.title, reason });
+      session.currentId = nextOpenActivity(session, next.activities)?.id ?? '';
+    });
+    cancelSkip();
+  }
+
+  // 回退某条：它回到待讲；传递依赖它的后续记录（过关/跳过/待确认）一律转为“待重新确认”。
+  function rollbackActivity(activityId: string): void {
+    const activity = course.activities.find((item) => item.id === activityId);
+    if (!activity) return;
+    persistSession((session, next) => {
+      const affected = new Set<string>();
+      const walk = (id: string): void => {
+        for (const other of next.activities) {
+          if (other.dependencies.includes(id) && !affected.has(other.id)) {
+            affected.add(other.id);
+            walk(other.id);
+          }
+        }
+      };
+      walk(activityId);
+      const dependents = [...affected].map((id) => ({
+        id,
+        title: next.activities.find((item) => item.id === id)?.title ?? '已移除的活动'
+      }));
+      for (const id of affected) {
+        const entry = session.entries[id];
+        if (entry) session.entries[id] = { ...entry, status: 'reconfirm' };
+      }
+      delete session.entries[activityId];
+      session.currentId = activityId;
+      pushSessionLog(session, { action: 'rollback', activityId, activityTitle: activity.title, dependents });
+    });
+  }
+
+  function resetClass(): void {
+    if (!window.confirm('确定清空本节课的进度与记录吗？日志会保留一条重置记录。')) return;
+    persistSession((session) => {
+      pushSessionLog(session, { action: 'reset' });
+      session.started = false;
+      session.startedAt = '';
+      session.currentId = '';
+      session.entries = {};
+    });
+    cancelSkip();
+  }
+
+  function editActivityInComposer(activityId: string): void {
+    selectedActivityId = activityId;
+    activeView = 'compose';
+  }
+
+  const sessionActionMeta: Record<SessionAction, { label: string; kind: string }> = {
+    start: { label: '开始上课', kind: 'start' },
+    pass: { label: '讲完过关', kind: 'pass' },
+    skip: { label: '跳过', kind: 'skip' },
+    rollback: { label: '回退', kind: 'rollback' },
+    reconfirm: { label: '重新确认过关', kind: 'reconfirm' },
+    reset: { label: '重置课堂', kind: 'reset' }
+  };
 
   function analyzeCourse(current: Course): Diagnostic[] {
     const issues: Diagnostic[] = [];
@@ -597,6 +866,9 @@
     <button class:active={activeView === 'path'} on:click={() => activeView = 'path'}><span>02</span><b>学习路径</b><small>多屏幕顺序预览</small></button>
     <button class:active={activeView === 'issues'} on:click={() => activeView = 'issues'}><span>03</span><b>质量检查</b><small>音素、句子与反馈</small></button>
     <button class:active={activeView === 'versions'} on:click={() => activeView = 'versions'}><span>04</span><b>版本与复用</b><small>复制、存档与比较</small></button>
+    <button class:active={activeView === 'playback'} on:click={() => activeView = 'playback'}>
+      <span>05</span><b>课堂播放{#if course.session.started}<i class="session-live-dot" aria-label="课堂进行中"></i>{/if}</b><small>进度、锁定与课堂记录</small>
+    </button>
   </nav>
 
   {#if activeView === 'compose'}
@@ -803,6 +1075,214 @@
           </div>
         </Tile>
       </div>
+    </main>
+  {/if}
+
+  {#if activeView === 'playback'}
+    <main class="session-view">
+      <div class="view-heading">
+        <div>
+          <span class="kicker">CLASSROOM PLAYER</span>
+          <h2>课堂播放区</h2>
+          <p>{#if course.session.started}开始于 {formatTime(course.session.startedAt)} · 刷新或关掉页面后回来会停在当前活动。{:else}开始上课后，这里按课程顺序列出已完成与待讲活动，前置没过关的条目会保持锁定。{/if}</p>
+        </div>
+        {#if course.session.started}
+          <div class="session-heading-actions">
+            <Button size="small" kind="ghost" on:click={resetClass}>结束并重置课堂</Button>
+          </div>
+        {/if}
+      </div>
+
+      {#if !course.session.started}
+        <Tile class="session-start-card">
+          <span class="kicker">READY TO TEACH</span>
+          <h3>{course.title} · 共 {course.activities.length} 个活动 / {totalMinutes} 分钟</h3>
+          <ul>
+            <li>开始后按顺序播放，前置活动未过关时，依赖它的条目<b>保持锁定</b>并说明卡在哪一步。</li>
+            <li><b>讲完</b>、<b>跳过</b>（需填写原因）、<b>回退</b>都会记入课堂日志。</li>
+            <li>回退修改某条后，依赖它的后续记录自动转为<b>待重新确认</b>。</li>
+            <li>关掉页面再回来从当前活动继续；调整课程（增删、移动、改名）后，进度按原活动跟随。</li>
+          </ul>
+          <Button kind="primary" on:click={startClass}>开始上课</Button>
+        </Tile>
+      {:else}
+        <div class="session-progress">
+          <div class="progress-meta">
+            <b>{passedCount} 过关</b><span>{skippedCount} 跳过</span><span>{reconfirmCount} 待确认</span><span>{openCount} 未处理</span>
+          </div>
+          <div class="progress-track" aria-label="课堂进度"><i style="width: {sessionProgress}%"></i></div>
+          <strong>{sessionProgress}%</strong>
+        </div>
+
+        <div class="session-grid">
+          <section class="session-main">
+            {#if displayRow}
+              <article class:locked={displayRow.blockers.length > 0 && isBlocked(displayRow.activity)} class="current-card">
+                <div class="current-card-head">
+                  <span class="current-chip">{skipRow ? `准备跳过 · ${String(displayRow.index + 1).padStart(2, '0')}` : `当前活动 · ${String(displayRow.index + 1).padStart(2, '0')}`}</span>
+                  <span class="activity-type {displayRow.activity.type}">{displayRow.activity.type}</span>
+                </div>
+                <h3>{displayRow.activity.title}</h3>
+                <p class="current-content">{displayRow.activity.content || '（未填写教学内容）'}</p>
+                {#if displayRow.activity.prompt}<blockquote>{displayRow.activity.prompt}</blockquote>{/if}
+                <div class="current-meta">
+                  <span>{displayRow.activity.duration} 分钟</span>
+                  <span>难度 {displayRow.activity.difficulty}/5</span>
+                  {#if displayRow.activity.phonemes.length}<span>{displayRow.activity.phonemes.join(' · ')}</span>{/if}
+                </div>
+
+                {#if displayRow.blockers.length === 0}
+                  <p class="prereq-ok">没有前置依赖，可直接开讲。</p>
+                {:else if isBlocked(displayRow.activity)}
+                  <div class="lock-note">
+                    <b>🔒 前置活动未过关，本活动锁定，卡在：</b>
+                    <ul>
+                      {#each displayRow.blockers as blocker}
+                        {#if blocker.missing}
+                          <li>前置活动「{blocker.title}」已从课程移除——请先到课程编排中修复依赖。</li>
+                        {:else if blocker.entry?.status === 'skipped'}
+                          <li>「{blocker.title}」已被跳过{#if blocker.entry.reason}（原因：{blocker.entry.reason}）{/if}，未过关。</li>
+                        {:else if blocker.entry?.status === 'reconfirm'}
+                          <li>「{blocker.title}」已回退，等待重新确认过关。</li>
+                        {:else}
+                          <li>「{blocker.title}」尚未讲到（待讲）。</li>
+                        {/if}
+                      {/each}
+                    </ul>
+                  </div>
+                {:else}
+                  <p class="prereq-ok">前置活动均已过关，可以开讲。</p>
+                {/if}
+
+                {#if skipRow}
+                  <div class="skip-form">
+                    <TextArea
+                      labelText="跳过原因（必填）"
+                      rows={2}
+                      value={skipReason}
+                      placeholder="例如：学生已掌握 /m/，本活动合并到下一个听音游戏。"
+                      on:input={(event) => (skipReason = readText(event))}
+                    />
+                    <div class="skip-actions">
+                      <Button size="small" kind="primary" disabled={!skipReason.trim()} on:click={confirmSkip}>确认跳过</Button>
+                      <Button size="small" kind="ghost" on:click={cancelSkip}>取消</Button>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="current-actions">
+                    <Button
+                      size="small"
+                      kind="primary"
+                      disabled={isBlocked(displayRow.activity)}
+                      on:click={() => passActivity(displayRow.activity.id)}
+                    >
+                      {displayRow.entry?.status === 'reconfirm' ? '重新确认过关' : '讲完，过关'}
+                    </Button>
+                    <Button size="small" kind="tertiary" on:click={() => beginSkip(displayRow.activity.id)}>跳过（填写原因）</Button>
+                    <Button size="small" kind="ghost" on:click={() => editActivityInComposer(displayRow.activity.id)}>去编排修改</Button>
+                  </div>
+                {/if}
+              </article>
+            {:else}
+              <Tile class="session-finished">
+                <h3>{sessionRows.some((row) => row.entry) ? '所有活动已处理完毕 🎉' : '暂无可播放的活动'}</h3>
+                <p>
+                  {sessionRows.some((row) => row.entry)
+                    ? `过关 ${passedCount} 个，跳过 ${skippedCount} 个。可在下方列表回退任意活动补讲。`
+                    : '课程里还没有活动，请先到课程编排中添加。'}
+                </p>
+                {#if reconfirmCount > 0}<p class="reconfirm-hint">还有 {reconfirmCount} 个活动等待重新确认。</p>{/if}
+              </Tile>
+            {/if}
+
+            <div class="checklist">
+              <div class="checklist-heading">
+                <h3>课堂清单</h3>
+                <div class="checklist-legend">
+                  <span><i class="dot-completed"></i>已完成</span>
+                  <span><i class="dot-skipped"></i>跳过</span>
+                  <span><i class="dot-reconfirm"></i>待确认</span>
+                  <span><i class="dot-locked"></i>锁定</span>
+                </div>
+              </div>
+              {#each sessionRows as row (row.activity.id)}
+                {@const blocked = isBlocked(row.activity)}
+                {@const isCurrent = !skipRow && currentRow?.activity.id === row.activity.id}
+                <article
+                  class="session-row status-{row.entry?.status ?? (blocked ? 'locked' : 'pending')}"
+                  class:current={isCurrent}
+                >
+                  <button
+                    class="row-main"
+                    disabled={Boolean(row.entry) || blocked}
+                    title={!row.entry && !blocked ? '点此设为当前活动' : row.entry ? '' : '前置活动未过关'}
+                    on:click={() => setCurrent(row.activity)}
+                  >
+                    <span class="sequence">{String(row.index + 1).padStart(2, '0')}</span>
+                    <span class="activity-type {row.activity.type}">{row.activity.type}</span>
+                    <span class="row-copy">
+                      <b>{row.activity.title}</b>
+                      <small>
+                        {#if row.entry?.status === 'completed'}{formatTime(row.entry.at)} 过关
+                        {:else if row.entry?.status === 'skipped'}{formatTime(row.entry.at)} 跳过 · 原因：{row.entry.reason}
+                        {:else if row.entry?.status === 'reconfirm'}{#if blocked}前置改动后待前置重新过关，再确认本活动{:else}前置已回退修改，请重新确认本活动是否过关{/if}
+                        {:else if blocked}
+                          🔒 卡在：
+                          {row.blockers
+                            .filter((blocker) => blocker.missing || blocker.entry?.status !== 'completed')
+                            .map((blocker) => blocker.missing ? `${blocker.title}（已移除）` : blocker.title)
+                            .join('、')}
+                        {:else}待讲 · {row.activity.duration} 分钟{/if}
+                      </small>
+                    </span>
+                  </button>
+                  <span class="row-actions">
+                    {#if isCurrent}<em class="current-pill">当前</em>{/if}
+                    {#if row.entry?.status === 'completed' || row.entry?.status === 'skipped'}
+                      <Button size="small" kind="ghost" on:click={() => rollbackActivity(row.activity.id)}>回退</Button>
+                    {:else if row.entry?.status === 'reconfirm'}
+                      <Button size="small" kind="primary" disabled={blocked} on:click={() => passActivity(row.activity.id)}>重新确认</Button>
+                      <Button size="small" kind="ghost" on:click={() => rollbackActivity(row.activity.id)}>回退</Button>
+                    {:else}
+                      <Button size="small" kind="ghost" on:click={() => beginSkip(row.activity.id)}>跳过</Button>
+                    {/if}
+                  </span>
+                </article>
+              {/each}
+            </div>
+          </section>
+
+          <aside class="session-log">
+            <Tile class="log-card">
+              <div class="section-title">
+                <div><span class="kicker">CLASS LOG</span><h3>课堂记录</h3><p>讲完、跳过、回退与重新确认均留痕。</p></div>
+                <Tag type="cool-gray">{course.session.logs.length} 条</Tag>
+              </div>
+              <div class="log-list">
+                {#each sessionLogs as log (log.id)}
+                  {#if log.action === 'start'}
+                    <div class="log-divider"><span>本节课开始 · {formatTime(log.at)}</span></div>
+                  {:else if log.action === 'reset'}
+                    <div class="log-divider log-reset"><span>课堂已重置 · {formatTime(log.at)}</span></div>
+                  {:else}
+                    <article class="log-entry {sessionActionMeta[log.action].kind}">
+                      <span class="log-time">{formatTime(log.at)}</span>
+                      <b>{sessionActionMeta[log.action].label}</b>
+                      {#if log.activityTitle}<em>{log.activityTitle}</em>{/if}
+                      {#if log.action === 'skip'}<p>原因：{log.reason}</p>{/if}
+                      {#if log.action === 'rollback' && log.dependents?.length}
+                        <p>转待重新确认：{log.dependents.map((item) => item.title).join('、')}</p>
+                      {/if}
+                    </article>
+                  {/if}
+                {:else}
+                  <p class="empty-state">还没有课堂操作记录。</p>
+                {/each}
+              </div>
+            </Tile>
+          </aside>
+        </div>
+      {/if}
     </main>
   {/if}
 
